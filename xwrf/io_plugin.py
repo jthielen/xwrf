@@ -7,13 +7,18 @@ import warnings
 import pandas as pd
 import xarray as xr
 
+from .diagnostics import calc_base_diagnostics
+from .grid import add_horizontal_projection_coordinates
+
 _LAT_COORDS = ('XLAT', 'XLAT_M', 'XLAT_U', 'XLAT_V', 'CLAT', 'XLAT_C')
 
 _LON_COORDS = ('XLONG', 'XLONG_M', 'XLONG_U', 'XLONG_V', 'CLONG', 'XLONG_C')
 
+_VERTICAL_COORDS = ('ZNU', 'ZNW')
+
 _TIME_COORD_VARS = ('XTIME', 'Times', 'Time', 'time')
 
-_ALL_COORDS = set(itertools.chain(*[_LAT_COORDS, _LON_COORDS, _TIME_COORD_VARS]))
+_ALL_COORDS = set(itertools.chain(*[_LAT_COORDS, _LON_COORDS, _VERTICAL_COORDS, _TIME_COORD_VARS]))
 
 
 def is_remote_uri(path: str) -> bool:
@@ -34,12 +39,15 @@ def _normalize_path(path):
     return path
 
 
-def clean(dataset):
+def fixup_coords(dataset):
     """
-    Clean up the dataset.
+    Clean up coordinates on the dataset.
     """
+    # Promote coordinate-like data variables to coordinates
     coords = set(dataset.variables).intersection(_ALL_COORDS)
     dataset = dataset.set_coords(coords)
+
+    # Fix time coords and reduce time in lat/lon and vertical coords
     for coord in dataset.coords:
         attrs = dataset[coord].attrs
         encoding = dataset[coord].encoding
@@ -51,16 +59,31 @@ def clean(dataset):
                 )
             except:
                 warnings.warn(f'Failed to parse time coordinate: {coord}', stacklevel=2)
-
         elif coord in (_LON_COORDS + _LAT_COORDS) and dataset[coord].ndim == 3:
-
-            attrs = dataset[coord].attrs
-            encoding = dataset[coord].encoding
             dataset = dataset.assign_coords(
                 {coord: (dataset[coord].dims[1:], dataset[coord].data[0, :, :])}
             )
+        elif coord in (_VERTICAL_COORDS) and dataset[coord].ndim == 2:
+            dataset = dataset.assign_coords(
+                {coord: (dataset[coord].dims[1:], dataset[coord].data[0, :])}
+            )
+
         dataset[coord].attrs = attrs
         dataset[coord].encoding = encoding
+
+    # Handle horizontal projection coordinates
+    dataset = add_horizontal_projection_coordinates(dataset)
+
+    # Clean up vertical and time coordinates (to make dimension coordinate) if able
+    if 'ZNU' in dataset.coords and 'bottom_top' in dataset.dims and dataset['ZNU'].ndim == 1:
+        dataset['bottom_top'] = dataset['ZNU']
+        del dataset['ZNU']
+    if 'ZNW' in dataset.coords and 'bottom_top_stag' in dataset.dims and dataset['ZNW'].ndim == 1:
+        dataset['bottom_top_stag'] = dataset['ZNW']
+        del dataset['ZNW']
+    if 'XTIME' in dataset.coords and 'Time' in dataset.dims and dataset['XTIME'].ndim == 1:
+        dataset['Time'] = dataset['XTIME']
+        del dataset['XTIME']
 
     return dataset
 
@@ -84,6 +107,8 @@ class WRFBackendEntrypoint(xr.backends.BackendEntrypoint):
         persist=False,
         lock=None,
         autoclose=False,
+        destagger=False,
+        drop_diagnostic_origin_components=True
     ):
 
         filename_or_obj = _normalize_path(filename_or_obj)
@@ -112,4 +137,11 @@ class WRFBackendEntrypoint(xr.backends.BackendEntrypoint):
                 decode_timedelta=decode_timedelta,
             )
 
-        return clean(dataset)
+        dataset = calc_base_diagnostics(dataset, drop=drop_diagnostic_origin_components)
+        # TODO: dataset = modify_attrs_to_cf(dataset)
+
+        if destagger:
+            # TODO: dataset = destagger(dataset)
+            return NotImplementedError("Automatic destaggering not yet implemented")
+
+        return fixup_coords(dataset)
